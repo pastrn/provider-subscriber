@@ -11,6 +11,7 @@ import { AggregatorV3Interface } from "@chainlink/contracts/src/v0.8/shared/inte
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { EnumerableSet } from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 import { ISubscriptionRegistry } from "./interfaces/ISubscriptionRegistry.sol";
 import { SubscriptionRegistryStorage } from "./SubscriptionRegistryStorage.sol";
@@ -24,6 +25,7 @@ contract SubscriptionRegistry is
     ISubscriptionRegistry
 {
     using SafeERC20 for IERC20;
+    using EnumerableSet for EnumerableSet.UintSet;
 
     uint256 public constant MIN_PROVIDER_FEE_USD = 50; // $50
     uint256 public constant MIN_SUBSCRIBER_DEPOSIT_USD = 100; // $100
@@ -103,8 +105,6 @@ contract SubscriptionRegistry is
             balance: 0,
             feePerPeriod: _safeCastToUint64(feePerPeriod),
             periodInSeconds: _safeCastToUint64(periodInSeconds),
-            lastClaim: 0,
-            activeSubscribers: 0,
             owner: msg.sender,
             status: ProviderStatus.Active
         });
@@ -139,81 +139,128 @@ contract SubscriptionRegistry is
     }
 
     /**
-     * @notice Registers a new subscriber with a specified starting deposit and associates it with a provider.
+     * @notice Registers a new subscriber with a specified starting deposit.
      * @param subscriberId The unique identifier for the subscriber.
      * @param startingDeposit The initial deposit amount in tokens for the subscription.
-     * @param providerId The unique identifier of the provider to subscribe to.
-     * @dev Reverts if the subscriber already exists, if the provider is inactive, or if the starting deposit is below the minimum allowed. Transfers the subscription fee to the provider and stores the remaining balance for the subscriber.
+     * @dev Reverts if the subscriber already exists or if the starting deposit is below the minimum allowed.
+     * Transfers the subscription fee to the contract and stores the balance for the subscriber.
      */
     function registerSubscriber(
         uint256 subscriberId,
-        uint256 startingDeposit,
-        uint256 providerId
+        uint256 startingDeposit
     ) external whenNotPaused {
         if (_subscribers[subscriberId].status != SubscriberStatus.Nonexistent) {
             revert SubscriberWithSameIdAlreadyRegistered();
         }
 
-        Provider storage provider = _providers[providerId];
-
-        if (provider.status != ProviderStatus.Active) {
-            revert ProviderIsInactive();
-        }
-
-        uint256 minRequiredDeposit = provider.feePerPeriod * 2;
-        if (_getTokenValueInUSD(startingDeposit) < MIN_SUBSCRIBER_DEPOSIT_USD || startingDeposit < minRequiredDeposit) {
+        if (_getTokenValueInUSD(startingDeposit) < MIN_SUBSCRIBER_DEPOSIT_USD) {
             revert DepositLessThanMinimalAllowed();
         }
 
         _subscribers[subscriberId] = Subscriber({
-            balance: _safeCastToUint64(startingDeposit - provider.feePerPeriod),
-            providerId: _safeCastToUint64(providerId),
-            startDate: _safeCastToUint64(block.timestamp),
-            dueDate: _safeCastToUint64(block.timestamp + provider.periodInSeconds),
-            owner: msg.sender,
-            status: SubscriberStatus.Active
+            balance: _safeCastToUint64(startingDeposit),
+            status: SubscriberStatus.Active,
+            owner: msg.sender
         });
-
-        provider.balance += provider.feePerPeriod;
-        provider.activeSubscribers += 1;
 
         IERC20(_token).safeTransferFrom(msg.sender, address(this), startingDeposit);
 
-        emit SubscriberRegistered(subscriberId, providerId);
+        emit SubscriberRegistered(subscriberId, msg.sender);
     }
 
     /**
-     * @notice Deletes a subscriber and transfers any free balance back to the subscriber's owner.
-     * @param subscriberId The unique identifier of the subscriber to delete.
-     * @dev Reverts if the subscriber is not active or if the caller is not the owner of the subscriber.
-     * Transfers any free balance to the owner and reallocates reserved balance to the provider.
+     * @notice Adds a subscription for a subscriber to a specified provider.
+     * @param subscriberId The unique identifier of the subscriber.
+     * @param providerId The unique identifier of the provider.
+     * @dev Reverts if the subscriber is not active, if the caller is not the owner of the subscriber,
+     * if the subscription is already active, if the provider is inactive, or if the subscriber has insufficient balance.
      */
-    function deleteSubscriber(uint256 subscriberId) external whenNotPaused {
-        Subscriber storage subscriber = _subscribers[subscriberId];
-
-        if (subscriber.status != SubscriberStatus.Active) {
+    function addSubscription(uint256 subscriberId, uint256 providerId) external whenNotPaused {
+        if (_subscribers[subscriberId].status != SubscriberStatus.Active) {
             revert InvalidSubscriberId();
         }
-        if (subscriber.owner != msg.sender) {
+        if (_subscribers[subscriberId].owner != msg.sender) {
+            revert Unauthorized();
+        }
+        if (isActiveSubscription(subscriberId, providerId)) {
+            revert SubscriptionAlreadyActive(providerId);
+        }
+
+        Provider storage provider = _providers[providerId];
+
+        if (provider.status != ProviderStatus.Active) {
+            revert ProviderIsInactive(providerId);
+        }
+        if (provider.feePerPeriod > _subscribers[subscriberId].balance) {
+            revert InsufficientBalance();
+        }
+
+        _addSubscription(subscriberId, providerId);
+        provider.balance += provider.feePerPeriod;
+        _subscribers[subscriberId].balance -= provider.feePerPeriod;
+        emit SubscriptionAdded(subscriberId, providerId);
+    }
+
+    /**
+     * @notice Adds multiple subscriptions for a subscriber to the specified providers.
+     * @param subscriberId The unique identifier of the subscriber.
+     * @param providerIds An array of unique identifiers of the providers.
+     * @dev Reverts if the subscriber is not active, if the caller is not the owner of the subscriber,
+     * if any subscription is already active, if any provider is inactive, or if the subscriber has insufficient balance.
+     */
+    function addSubscriptions(
+        uint256 subscriberId,
+        uint256[] memory providerIds
+    ) external whenNotPaused {
+        if (_subscribers[subscriberId].status != SubscriberStatus.Active) {
+            revert InvalidSubscriberId();
+        }
+        if (_subscribers[subscriberId].owner != msg.sender) {
             revert Unauthorized();
         }
 
-        uint256 freeBalance = calculateFreeBalance(subscriberId);
+        uint256 cost;
 
-        if (freeBalance != 0) {
-            uint256 subscriberBalance = subscriber.balance;
-            uint256 reservedBalance = subscriberBalance - freeBalance;
+        uint256 len = providerIds.length;
+        for(uint256 i; i < len;) {
+            if (isActiveSubscription(subscriberId, providerIds[i])) {
+                revert SubscriptionAlreadyActive(providerIds[i]);
+            }
 
-            Provider storage provider = _providers[subscriber.providerId];
-            provider.balance += _safeCastToUint64(reservedBalance);
-            provider.activeSubscribers -= 1;
+            Provider storage provider = _providers[providerIds[i]];
 
-            IERC20(_token).safeTransfer(msg.sender, freeBalance);
+            if (provider.status != ProviderStatus.Active) {
+                revert ProviderIsInactive(providerIds[i]);
+            }
+            cost += provider.feePerPeriod;
+            if (cost > _subscribers[subscriberId].balance) {
+                revert InsufficientBalance();
+            }
+
+            _addSubscription(subscriberId, providerIds[i]);
+            provider.balance += provider.feePerPeriod;
+            emit SubscriptionAdded(subscriberId, providerIds[i]);
+            ++i;
+        }
+        _subscribers[subscriberId].balance -= _safeCastToUint64(_subscribers[subscriberId].balance - cost);
+    }
+
+    /**
+     * @notice Deletes a subscription.
+     * @param subscriberId The unique identifier of the subscriber.
+     * @param subscriberId The unique identifier of the provider.
+     * @dev Reverts if the subscriber is not active or if the caller is not the owner of the subscriber.
+     */
+    function deleteSubscription(uint256 subscriberId, uint256 providerId) external whenNotPaused {
+        if (_subscribers[subscriberId].status != SubscriberStatus.Active) {
+            revert InvalidSubscriberId();
+        }
+        if (_subscribers[subscriberId].owner != msg.sender) {
+            revert Unauthorized();
         }
 
-        delete _subscribers[subscriberId];
-
-        emit SubscriberDeleted(subscriberId);
+        _removeSubscription(subscriberId, providerId);
+        emit SubscriptionDeleted(subscriberId, providerId);
     }
 
     /**
@@ -239,13 +286,14 @@ contract SubscriptionRegistry is
     }
 
     /**
-     * @notice Claims earnings from a subscriber's balance for a given provider.
-     * @param providerId The unique identifier of the provider claiming earnings.
-     * @param subscriberId The unique identifier of the subscriber whose balance is used for the claim.
-     * @dev Reverts if the provider is not active, if the caller is not the owner of the provider, if the claim is made
-     * too early, or if the subscriber's balance is insufficient. If the balance is insufficient, the subscriber's status is paused.
+     * @notice Claims earnings from multiple subscribers for a specified provider.
+     * @param providerId The unique identifier of the provider.
+     * @param subscriberIds An array of unique identifiers of the subscribers whose earnings are being claimed.
+     * @dev Reverts if the provider is not active, if the caller is not the owner of the provider,
+     * if any subscription is inactive, if any claim is made too early, or if a subscriber has insufficient balance.
+     * If a subscriber has insufficient balance, their subscription is paused, and the subscription is removed.
      */
-    function claimEarnings(uint256 providerId, uint256 subscriberId) external whenNotPaused {
+    function claimEarnings(uint256 providerId, uint256[] memory subscriberIds) external whenNotPaused {
         Provider storage provider = _providers[providerId];
 
         if (provider.status != ProviderStatus.Active) {
@@ -256,22 +304,38 @@ contract SubscriptionRegistry is
             revert Unauthorized();
         }
 
-        if (block.timestamp - provider.lastClaim < provider.periodInSeconds) {
-            revert EarlyClaim();
+        uint256 totalClaimed;
+        uint256 feePerPeriod = provider.feePerPeriod;
+        uint256 len = subscriberIds.length;
+
+        for (uint256 i; i < len;) {
+            uint256 subscriberId = subscriberIds[i];
+
+            if (!isActiveSubscription(subscriberId, providerId)) {
+                revert InactiveSubscription(subscriberId);
+            }
+
+            uint256 lastClaim = _claims[providerId][subscriberId];
+            if (block.timestamp - lastClaim < provider.periodInSeconds) {
+                revert EarlyClaim();
+            }
+
+            Subscriber storage subscriber = _subscribers[subscriberId];
+
+            if (subscriber.balance < feePerPeriod) {
+                subscriber.status = SubscriberStatus.Paused;
+                _removeSubscription(subscriberId, providerId);
+                emit SubscriptionPaused(subscriberId, providerId);
+            } else {
+                subscriber.balance -= _safeCastToUint64(feePerPeriod);
+                _claims[providerId][subscriberId] = block.timestamp;
+                totalClaimed += feePerPeriod;
+                emit EarningsClaimed(providerId, subscriberId, block.timestamp, block.timestamp + provider.periodInSeconds);
+            }
+            unchecked { ++i; }
         }
 
-        Subscriber storage subscriber = _subscribers[subscriberId];
-
-        if (subscriber.balance < provider.feePerPeriod) {
-            subscriber.status = SubscriberStatus.Paused;
-            provider.activeSubscribers -= 1;
-            emit SubscriptionPaused(subscriberId, providerId);
-        } else {
-            subscriber.balance -= provider.feePerPeriod;
-            provider.balance += _safeCastToUint64(provider.feePerPeriod);
-            provider.lastClaim = _safeCastToUint64(block.timestamp);
-            emit EarningsClaimed(providerId, block.timestamp, block.timestamp + provider.periodInSeconds);
-        }
+        provider.balance += _safeCastToUint64(totalClaimed);
     }
 
     /**
@@ -441,15 +505,60 @@ contract SubscriptionRegistry is
      * Otherwise, it deducts the provider's fee per period from the balance, if possible.
      */
     function calculateFreeBalance(uint256 subscriberId) public view returns (uint256) {
-        Subscriber storage subscriber = _subscribers[subscriberId];
-        Provider storage provider = _providers[subscriber.providerId];
+        uint256[] memory activeSubscriptions = getSubscriberSubscriptions(subscriberId);
 
-        uint256 totalBalance = subscriber.balance;
-        if (subscriber.dueDate > block.timestamp) {
-            return totalBalance;
-        } else {
-            return totalBalance > provider.feePerPeriod ? totalBalance - provider.feePerPeriod : 0;
+        Subscriber memory subscriber = _subscribers[subscriberId];
+        uint256 totalDebt;
+
+        uint256 len = activeSubscriptions.length;
+        for(uint256 i; i < len;) {
+
+            Provider memory provider = _providers[activeSubscriptions[i]];
+
+            if (block.timestamp >= _claims[activeSubscriptions[i]][subscriberId] + provider.periodInSeconds) {
+                totalDebt += provider.feePerPeriod;
+            }
         }
+        return subscriber.balance > totalDebt ? subscriber.balance - totalDebt : 0;
+    }
+
+    /**
+     * @notice Checks if a subscriber has an active subscription to a specific provider.
+     * @param subscriberId The unique identifier of the subscriber.
+     * @param providerId The unique identifier of the provider.
+     * @return True if the subscriber has an active subscription to the provider, otherwise false.
+     */
+    function isActiveSubscription(uint256 subscriberId, uint256 providerId) public view returns (bool) {
+        return _subscriberActiveSubscriptions[subscriberId].contains(providerId);
+    }
+
+    /**
+     * @notice Retrieves the list of active subscriptions for a specific subscriber.
+     * @param subscriberId The unique identifier of the subscriber.
+     * @return An array of provider IDs that the subscriber is actively subscribed to.
+     */
+    function getSubscriberSubscriptions(uint256 subscriberId) public view returns (uint256[] memory) {
+        return _subscriberActiveSubscriptions[subscriberId].values();
+    }
+
+    /**
+     * @notice Adds a subscription for a subscriber to a specific provider.
+     * @param subscriberId The unique identifier of the subscriber.
+     * @param providerId The unique identifier of the provider.
+     * @dev Internal function used to add a provider to the subscriber's list of active subscriptions.
+     */
+    function _addSubscription(uint256 subscriberId, uint256 providerId) internal {
+        _subscriberActiveSubscriptions[subscriberId].add(providerId);
+    }
+
+    /**
+     * @notice Removes a subscription for a subscriber from a specific provider.
+     * @param subscriberId The unique identifier of the subscriber.
+     * @param providerId The unique identifier of the provider.
+     * @dev Internal function used to remove a provider from the subscriber's list of active subscriptions.
+     */
+    function _removeSubscription(uint256 subscriberId, uint256 providerId) internal {
+        _subscriberActiveSubscriptions[subscriberId].remove(providerId);
     }
 
     /**

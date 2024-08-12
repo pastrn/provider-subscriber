@@ -2,6 +2,7 @@
 
 pragma solidity 0.8.24;
 
+import { EnumerableSet } from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import { ISubscriptionRegistryTypes } from "./interfaces/ISubscriptionRegistry.sol";
 
 /**
@@ -23,11 +24,17 @@ contract SubscriptionRegistryStorage is ISubscriptionRegistryTypes {
     address internal _priceOracle;
 
     /// @notice A mapping from provider IDs to provider details.
-    mapping(uint256 => Provider) internal _providers;
+    mapping(uint256 id => Provider) internal _providers;
 
     /// @notice A mapping from subscriber IDs to subscriber details.
-    mapping(uint256 => Subscriber) internal _subscribers;
+    mapping(uint256 id => Subscriber) internal _subscribers;
 
     /// @notice A mapping from signature hashes to their usage status to prevent replay attacks.
-    mapping(bytes32 => bool) internal _usedSignatures;
+    mapping(bytes32 signature => bool status) internal _usedSignatures;
+
+    /// @notice A mapping from subscriber to their current active subscriptions.
+    mapping(uint256 subscriberId => EnumerableSet.UintSet providers) internal _subscriberActiveSubscriptions;
+
+    /// @notice A mapping from provider to their subscribers last claims.
+    mapping(uint256 providerId => mapping(uint256 subscriberId => uint256 lastClaim)) internal _claims;
 }

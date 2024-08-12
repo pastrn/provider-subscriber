@@ -35,8 +35,6 @@ interface ISubscriptionRegistryTypes {
      * @param balance The current balance of the provider in the system.
      * @param feePerPeriod The fee charged by the provider for each subscription period.
      * @param periodInSeconds The duration of each subscription period in seconds.
-     * @param lastClaim The timestamp of the last earnings claim by the provider.
-     * @param activeSubscribers The number of active subscribers to the provider.
      * @param owner The address of the provider's owner.
      * @param status The current status of the provider (e.g., active or inactive).
      */
@@ -44,27 +42,19 @@ interface ISubscriptionRegistryTypes {
         uint64 balance;
         uint64 feePerPeriod;
         uint64 periodInSeconds;
-        uint64 lastClaim;
-        uint64 activeSubscribers;
-        address owner;
         ProviderStatus status;
+        address owner;
     }
 
      /**
      * @notice Contains details about a subscriber in the subscription system.
      * @dev Each `Subscriber` struct stores information relevant to a subscriber's subscription status and balance.
      * @param balance The current balance of the subscriber.
-     * @param providerId The ID of the provider to whom the subscriber is subscribed.
-     * @param startDate The timestamp when the subscription started.
-     * @param dueDate The timestamp when the next payment is due.
      * @param owner The address of the subscriber's owner.
      * @param status The current status of the subscriber (e.g., active or paused).
      */
     struct Subscriber {
         uint64 balance;
-        uint64 providerId;
-        uint64 startDate;
-        uint64 dueDate;
         address owner;
         SubscriberStatus status;
     }
@@ -129,12 +119,29 @@ interface ISubscriptionRegistryErrors {
     /**
      * @notice Thrown when an action requires a provider to be active, but the provider is inactive.
      */
-    error ProviderIsInactive();
+    error ProviderIsInactive(uint256 providerId);
 
     /**
      * @notice Thrown when the subscriber ID provided does not correspond to an active or existing subscriber.
      */
     error InvalidSubscriberId();
+
+    /**
+     * @notice Thrown when attempting to add a subscription that is already active.
+     * @param subscriptionId The unique identifier of the subscription that is already active.
+     */
+    error SubscriptionAlreadyActive(uint256 subscriptionId);
+
+    /**
+     * @notice Thrown when a subscriber does not have sufficient balance to cover the subscription fee.
+     */
+    error InsufficientBalance();
+
+    /**
+     * @notice Thrown when attempting to interact with a subscription that is not active.
+     * @param subscriberId The unique identifier of the subscriber whose subscription is inactive.
+     */
+    error InactiveSubscription(uint256 subscriberId);
 
     /**
      * @notice Thrown when a provider attempts to claim earnings before the allowed claim period has elapsed.
@@ -165,15 +172,23 @@ interface ISubscriptionRegistry is ISubscriptionRegistryTypes, ISubscriptionRegi
     /**
      * @notice Emitted when a new subscriber is registered.
      * @param subscriberId The unique identifier of the subscriber.
-     * @param providerId The unique identifier of the provider to which the subscriber is subscribed.
+     * @param owner The owner of the subscriber.
      */
-    event SubscriberRegistered(uint256 indexed subscriberId, uint256 indexed providerId);
+    event SubscriberRegistered(uint256 indexed subscriberId, address indexed owner);
 
     /**
-     * @notice Emitted when a subscriber is deleted.
-     * @param subscriberId The unique identifier of the subscriber that was deleted.
+     * @notice Emitted when a subscriber adds a subscription to a provider.
+     * @param subscriberId The unique identifier of the subscriber.
+     * @param providerId The unique identifier of the provider.
      */
-    event SubscriberDeleted(uint256 indexed subscriberId);
+    event SubscriptionAdded(uint256 indexed subscriberId, uint256 indexed providerId);
+
+    /**
+     * @notice Emitted when a subscriber deletes a subscription from a provider.
+     * @param subscriberId The unique identifier of the subscriber.
+     * @param providerId The unique identifier of the provider.
+     */
+    event SubscriptionDeleted(uint256 indexed subscriberId, uint256 indexed providerId);
 
     /**
      * @notice Emitted when funds are deposited into a subscriber's balance.
@@ -196,7 +211,7 @@ interface ISubscriptionRegistry is ISubscriptionRegistryTypes, ISubscriptionRegi
      * @param claimTimestamp The timestamp when the earnings were claimed.
      * @param nextClaimDate The timestamp when the provider can next claim earnings.
      */
-    event EarningsClaimed(uint256 indexed providerId, uint256 indexed claimTimestamp, uint256 indexed nextClaimDate);
+    event EarningsClaimed(uint256 indexed providerId, uint256 subscriberId, uint256 indexed claimTimestamp, uint256 nextClaimDate);
 
     /**
      * @notice Emitted when a provider withdraws their earnings.
@@ -233,12 +248,12 @@ interface ISubscriptionRegistry is ISubscriptionRegistryTypes, ISubscriptionRegi
     /**
      * @notice Registers a new subscriber with an initial deposit.
      */
-    function registerSubscriber(uint256 subscriberId, uint256 startingDeposit, uint256 providerId) external;
+    function registerSubscriber(uint256 subscriberId, uint256 startingDeposit) external;
 
     /**
      * @notice Deletes an existing subscriber.
      */
-    function deleteSubscriber(uint256 subscriberId) external;
+    function deleteSubscription(uint256 subscriberId, uint256 providerId) external;
 
     /**
      * @notice Adds funds to a subscriber's balance.
@@ -246,9 +261,9 @@ interface ISubscriptionRegistry is ISubscriptionRegistryTypes, ISubscriptionRegi
     function supplySubscriber(uint256 subscriberId, uint256 amount) external;
 
     /**
-     * @notice Claims earnings for a provider from a subscriber.
+     * @notice Claims earnings for a provider from subscribers.
      */
-    function claimEarnings(uint256 providerId, uint256 subscriberId) external;
+    function claimEarnings(uint256 providerId, uint256[] memory subscriberIds) external;
 
     /**
      * @notice Withdraws earnings for a provider.
@@ -284,5 +299,5 @@ interface ISubscriptionRegistry is ISubscriptionRegistryTypes, ISubscriptionRegi
      * @notice Calculates the free balance of a specific subscriber.
      */
     function calculateFreeBalance(uint256 subscriberId) external view returns (uint256);
-
 }
+
