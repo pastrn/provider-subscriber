@@ -10,19 +10,14 @@ interface Provider {
     balance: number;
     feePerPeriod: number;
     periodInSeconds: number;
-    lastClaim: number;
-    activeSubscribers: number;
+    status: ProviderStatus;
     owner: string
-    status: ProviderStatus
 
     [key: string]: number | string | ProviderStatus;
 }
 
 interface Subscriber {
     balance: number;
-    providerId: number;
-    startDate: number;
-    dueDate: number;
     owner: string;
     status: SubscriberStatus
 
@@ -49,6 +44,9 @@ describe("Contract 'SubscriptionRegistry'", async () => {
     const HARDHAT_CHAIN_ID = 31337;
     const DEFAULT_SUBSCRIBER_ID = 1337;
     const DEFAULT_STARTING_DEPOSIT = 200;
+    const LARGE_STARTING_DEPOSIT = 1_000_000;
+    const SECOND_PROVIDER_ID = 323;
+    const THIRD_PROVIDER_ID = 324;
 
     const REVERT_ERROR_INVALID_INITIALIZATION = "InvalidInitialization";
     const REVERT_ERROR_OWNABLE_UNAUTHORIZED_ACCOUNT = "OwnableUnauthorizedAccount";
@@ -64,15 +62,18 @@ describe("Contract 'SubscriptionRegistry'", async () => {
     const REVERT_ERROR_UNAUTHORIZED = "Unauthorized";
     const REVERT_ERROR_DEPOSIT_LESS_THAN_MINIMAL_ALLOWED = "DepositLessThanMinimalAllowed";
     const REVERT_ERROR_SUBSCRIBER_WITH_SAME_ID_ALREADY_REGISTERED = "SubscriberWithSameIdAlreadyRegistered";
-    const REVERT_ERROR_PROVIDER_IS_INACTIVE = "ProviderIsInactive";
+    const REVERT_ERROR_SUBSCRIPTION_ALREADY_ACTIVE = "SubscriptionAlreadyActive";
+    const REVERT_ERROR_PROVIDER_INACTIVE = "ProviderIsInactive";
     const REVERT_ERROR_INVALID_SUBSCRIBER_ID = "InvalidSubscriberId";
     const REVERT_ERROR_EARLY_CLAIM = "EarlyClaim";
-
+    const REVERT_ERROR_INSUFFICIENT_BALANCE = "InsufficientBalance";
+    const REVERT_ERROR_INACTIVE_SUBSCRIPTION = "InactiveSubscription";
 
     const EVENT_NAME_PROVIDER_REGISTERED = "ProviderRegistered";
     const EVENT_NAME_PROVIDER_DELETED = "ProviderDeleted";
     const EVENT_NAME_SUBSCRIBER_REGISTERED = "SubscriberRegistered";
-    const EVENT_NAME_SUBSCRIBER_DELETED = "SubscriberDeleted";
+    const EVENT_NAME_SUBSCRIPTION_ADDED = "SubscriptionAdded";
+    const EVENT_NAME_SUBSCRIPTION_DELETED = "SubscriptionDeleted";
     const EVENT_NAME_FUNDS_DEPOSITED = "FundsDeposited";
     const EVENT_NAME_EARNINGS_CLAIMED = "EarningsClaimed";
     const EVENT_NAME_SUBSCRIPTION_PAUSED = "SubscriptionPaused";
@@ -138,6 +139,35 @@ describe("Contract 'SubscriptionRegistry'", async () => {
         };
     }
 
+    async function deployRegistryAndRegisterMultipleProviders(): Promise<{ registry: Contract }> {
+        const { registry } = await deployRegistry();
+        const registryConnectedToProvider = registry.connect(provider) as Contract;
+        const firstSignature = await createDefaultSignature();
+        await registryConnectedToProvider.registerProvider(DEFAULT_PROVIDER_ID, DEFAULT_FEE, DEFAULT_PERIOD_IN_SECONDS, firstSignature);
+        const secondSignature = await createSignature(
+            deployer,
+            deployer,
+            SECOND_PROVIDER_ID,
+            DEFAULT_FEE,
+            DEFAULT_PERIOD_IN_SECONDS,
+            HARDHAT_CHAIN_ID
+        );
+        await registry.registerProvider(SECOND_PROVIDER_ID, DEFAULT_FEE, DEFAULT_PERIOD_IN_SECONDS, secondSignature);
+        const thirdSignature = await createSignature(
+            deployer,
+            deployer,
+            THIRD_PROVIDER_ID,
+            DEFAULT_FEE,
+            DEFAULT_PERIOD_IN_SECONDS,
+            HARDHAT_CHAIN_ID
+        );
+        await registry.registerProvider(THIRD_PROVIDER_ID, DEFAULT_FEE, DEFAULT_PERIOD_IN_SECONDS, thirdSignature);
+
+        return {
+            registry
+        };
+    }
+
     async function getTx(txResponsePromise: Promise<TransactionResponse>): Promise<TransactionReceipt> {
         const txReceipt = await txResponsePromise;
         return txReceipt.wait();
@@ -168,19 +198,15 @@ describe("Contract 'SubscriptionRegistry'", async () => {
             balance: 0,
             feePerPeriod: DEFAULT_FEE,
             periodInSeconds: DEFAULT_PERIOD_IN_SECONDS,
-            lastClaim: 0,
-            activeSubscribers: 0,
-            owner: provider.address,
-            status: ProviderStatus.Active
+            status: ProviderStatus.Active,
+            owner: provider.address
+
         }
     }
 
     async function createDefaultSubscriberState(): Promise<Subscriber> {
         return {
-            balance: DEFAULT_STARTING_DEPOSIT - DEFAULT_FEE,
-            providerId: DEFAULT_PROVIDER_ID,
-            startDate: await time.latest(),
-            dueDate: await time.latest() + DEFAULT_PERIOD_IN_SECONDS,
+            balance: DEFAULT_STARTING_DEPOSIT,
             owner: deployer.address,
             status: SubscriberStatus.Active
         }
@@ -418,8 +444,6 @@ describe("Contract 'SubscriptionRegistry'", async () => {
                balance: 0,
                feePerPeriod: 0,
                periodInSeconds: 0,
-               lastClaim: 0,
-               activeSubscribers: 0,
                owner: ethers.ZeroAddress,
                status: ProviderStatus.Nonexistent
            }
@@ -460,19 +484,13 @@ describe("Contract 'SubscriptionRegistry'", async () => {
         it("Executes as expected and emits the correct event", async () => {
             const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
 
-            const tx = await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID);
+            const tx = await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
             const actualSubscriberState: Subscriber = await registry.getSubscriber(DEFAULT_SUBSCRIBER_ID);
             const expectedSubscriberState: Subscriber = await createDefaultSubscriberState();
 
             await expect(tx)
                 .to.emit(registry, EVENT_NAME_SUBSCRIBER_REGISTERED)
-                .withArgs(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID);
-
-            await expect(tx).to.changeTokenBalances(
-                token,
-                [deployer, registry],
-                [-DEFAULT_STARTING_DEPOSIT, +DEFAULT_STARTING_DEPOSIT]
-            );
+                .withArgs(DEFAULT_SUBSCRIBER_ID, deployer.address);
 
             compareSubscriberState(actualSubscriberState, expectedSubscriberState);
         });
@@ -481,300 +499,435 @@ describe("Contract 'SubscriptionRegistry'", async () => {
             const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
             await registry.pause();
 
-            await expect(registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID))
+            await expect(registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT))
                 .to.be.revertedWithCustomError(registry, REVERT_ERROR_ENFORCED_PAUSE);
         });
 
         it("Is reverted if the subscriber with same id is already registered", async () => {
             const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID);
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
 
-            await expect(registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID))
+            await expect(registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT))
                 .to.be.revertedWithCustomError(registry, REVERT_ERROR_SUBSCRIBER_WITH_SAME_ID_ALREADY_REGISTERED);
-        });
-
-        it("Is reverted if the provider with the selected id is not active", async () => {
-            const { registry } = await loadFixture(deployRegistry);
-
-            await expect(registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID))
-                .to.be.revertedWithCustomError(registry, REVERT_ERROR_PROVIDER_IS_INACTIVE);
         });
 
         it("Is reverted if the starting deposit is less than allowed one", async () => {
             const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
 
-            await expect(registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, 0, DEFAULT_PROVIDER_ID))
+            await expect(registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, 0))
                 .to.be.revertedWithCustomError(registry, REVERT_ERROR_DEPOSIT_LESS_THAN_MINIMAL_ALLOWED);
-
-            await expect(registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, (DEFAULT_FEE * 2) - 1, DEFAULT_PROVIDER_ID))
-                .to.be.revertedWithCustomError(registry, REVERT_ERROR_DEPOSIT_LESS_THAN_MINIMAL_ALLOWED);
-        })
+        });
     });
 
-    describe("Function 'deleteSubscriber()'", async () => {
-        it("Executes as expected and emits correct event", async () => {
-            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID);
+    describe("Function 'addSubscription()'", async () => {
+       it("Executes as expected and emits correct event", async () => {
+           const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+           await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
 
-            const tx = await registry.deleteSubscriber(DEFAULT_SUBSCRIBER_ID);
+           const tx = await registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID);
+
+           await expect(tx)
+               .to.emit(registry, EVENT_NAME_SUBSCRIPTION_ADDED)
+               .withArgs(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID);
+
+           expect(await registry.isActiveSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID))
+               .to.eq(true);
+       });
+
+       it("Is reverted if the contract is paused", async () => {
+           const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+           await registry.pause();
+
+           await expect(registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID))
+               .to.be.revertedWithCustomError(registry, REVERT_ERROR_ENFORCED_PAUSE);
+       });
+
+       it("Is reverted if subscriber is inactive", async () => {
+           const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+
+           await expect(registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID))
+               .to.be.revertedWithCustomError(registry, REVERT_ERROR_INVALID_SUBSCRIBER_ID);
+       });
+
+       it("Is reverted if the caller is not an owner of subscriber", async () => {
+           const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+           await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
+           const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
+
+           await expect(registryConnectedToAttacker.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID))
+               .to.be.revertedWithCustomError(registry, REVERT_ERROR_UNAUTHORIZED);
+       });
+
+       it("Is reverted if the subscription is already active", async () => {
+           const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+           await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
+
+           await registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID);
+
+           await expect(registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID))
+               .to.be.revertedWithCustomError(registry, REVERT_ERROR_SUBSCRIPTION_ALREADY_ACTIVE);
+       });
+
+       it("Is reverted if the provider is inactive", async () => {
+           const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+           await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
+
+           await expect(registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID + 1))
+               .to.be.revertedWithCustomError(registry, REVERT_ERROR_PROVIDER_INACTIVE);
+       });
+
+       it("Is reverted if the balance is insufficient", async () => {
+           const { registry } = await loadFixture(deployRegistryAndRegisterMultipleProviders);
+           await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
+           await registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID);
+           await registry.addSubscription(DEFAULT_SUBSCRIBER_ID, SECOND_PROVIDER_ID);
+
+
+           await expect(registry.addSubscription(DEFAULT_SUBSCRIBER_ID, THIRD_PROVIDER_ID))
+               .to.be.revertedWithCustomError(registry, REVERT_ERROR_INSUFFICIENT_BALANCE);
+       });
+    });
+
+    describe("Function 'addSubscriptions()'", async () => {
+        let providers: number[];
+        before( () => {
+           providers = [DEFAULT_PROVIDER_ID, SECOND_PROVIDER_ID, THIRD_PROVIDER_ID]
+        });
+        it("Executes as expected and emits correct event", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterMultipleProviders);
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, LARGE_STARTING_DEPOSIT);
+
+            const tx = await registry.addSubscriptions(DEFAULT_SUBSCRIBER_ID, providers);
 
             await expect(tx)
-                .to.emit(registry, EVENT_NAME_SUBSCRIBER_DELETED)
-                .withArgs(DEFAULT_SUBSCRIBER_ID);
+                .to.emit(registry, EVENT_NAME_SUBSCRIPTION_ADDED)
+                .withArgs(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID)
+                .and.to.emit(registry, EVENT_NAME_SUBSCRIPTION_ADDED)
+                .withArgs(DEFAULT_SUBSCRIBER_ID, SECOND_PROVIDER_ID)
+                .and.to.emit(registry, EVENT_NAME_SUBSCRIPTION_ADDED)
+                .withArgs(DEFAULT_SUBSCRIBER_ID, THIRD_PROVIDER_ID);
+
+            expect(await registry.isActiveSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID))
+                .to.eq(true);
+            expect(await registry.isActiveSubscription(DEFAULT_SUBSCRIBER_ID, SECOND_PROVIDER_ID))
+                .to.eq(true);
+            expect(await registry.isActiveSubscription(DEFAULT_SUBSCRIBER_ID, THIRD_PROVIDER_ID))
+                .to.eq(true);
+        });
+
+        it("Is reverted if the contract is paused", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            await registry.pause();
+
+            await expect(registry.addSubscriptions(DEFAULT_SUBSCRIBER_ID, providers))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_ENFORCED_PAUSE);
+        });
+
+        it("Is reverted if subscriber is inactive", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterMultipleProviders);
+
+            await expect(registry.addSubscriptions(DEFAULT_SUBSCRIBER_ID, providers))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_INVALID_SUBSCRIBER_ID);
+        });
+
+        it("Is reverted if the caller is not an owner of subscriber", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterMultipleProviders);
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, LARGE_STARTING_DEPOSIT);
+            const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
+
+            await expect(registryConnectedToAttacker.addSubscriptions(DEFAULT_SUBSCRIBER_ID, providers))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_UNAUTHORIZED);
+        });
+
+        it("Is reverted if the subscription is already active", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterMultipleProviders);
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, LARGE_STARTING_DEPOSIT);
+
+            await registry.addSubscriptions(DEFAULT_SUBSCRIBER_ID, providers);
+
+            await expect(registry.addSubscriptions(DEFAULT_SUBSCRIBER_ID, providers))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_SUBSCRIPTION_ALREADY_ACTIVE);
+        });
+
+        it("Is reverted if the provider is inactive", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterMultipleProviders);
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, LARGE_STARTING_DEPOSIT);
+            providers.push(THIRD_PROVIDER_ID + 1);
+
+            await expect(registry.addSubscriptions(DEFAULT_SUBSCRIBER_ID, providers))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_PROVIDER_INACTIVE);
+        });
+
+        it("Is reverted if the balance is insufficient", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterMultipleProviders);
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
+
+            await expect(registry.addSubscriptions(DEFAULT_SUBSCRIBER_ID, providers))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_INSUFFICIENT_BALANCE);
+        });
+    });
+
+    describe("Function 'deleteSubscription()'", async () => {
+        it("Executes as expected and emits correct event", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
+            await registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID);
+
+            await expect(registry.deleteSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID))
+                .to.emit(registry, EVENT_NAME_SUBSCRIPTION_DELETED)
+                .withArgs(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID);
+
+            expect(await registry.isActiveSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID))
+                .to.eq(false);
+        });
+
+        it("Is reverted if the contract is paused", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            await registry.pause();
+
+            await expect(registry.deleteSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_ENFORCED_PAUSE);
+        });
+
+        it("Is reverted if the subscriber is inactive", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+
+            await expect(registry.deleteSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_INVALID_SUBSCRIBER_ID);
+        });
+
+        it("Is reverted if the caller is not the owner of the subscriber", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
+            await registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID);
+            const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
+
+            await expect(registryConnectedToAttacker.deleteSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_UNAUTHORIZED);
+        });
+    });
+
+    describe("Function 'supplySubscriber()'", async () => {
+        it("Executes as expected and emits correct event", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
+
+            const oldFreeBalance: number = Number(await registry.calculateFreeBalance(DEFAULT_SUBSCRIBER_ID));
+
+            const tx = await registry.supplySubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_FEE);
+            await expect(tx)
+                .to.emit(registry, EVENT_NAME_FUNDS_DEPOSITED)
+                .withArgs(deployer.address, DEFAULT_SUBSCRIBER_ID, DEFAULT_FEE);
 
             await expect(tx)
                 .to.changeTokenBalances(
                     token,
                     [registry, deployer],
-                    [-DEFAULT_STARTING_DEPOSIT+DEFAULT_FEE, +DEFAULT_STARTING_DEPOSIT-DEFAULT_FEE]
+                    [+DEFAULT_FEE, -DEFAULT_FEE]
                 );
 
-            const expectedSubscriberState: Subscriber = {
-                balance: 0,
-                providerId: 0,
-                startDate: 0,
-                dueDate: 0,
-                owner: ethers.ZeroAddress,
-                status: SubscriberStatus.Nonexistent
-            }
-
-            const actualSubscriberState: Subscriber = await registry.getSubscriber(DEFAULT_SUBSCRIBER_ID);
-
-            compareSubscriberState(actualSubscriberState, expectedSubscriberState);
-
-            expect(await registry.calculateFreeBalance(DEFAULT_SUBSCRIBER_ID)).to.eq(0);
+            expect(Number(await registry.calculateFreeBalance(DEFAULT_SUBSCRIBER_ID))).to.eq(oldFreeBalance + DEFAULT_FEE);
         });
 
-        it("Is reverted if subscriber with provided id is not active", async () => {
+        it("Is reverted if the contract is paused", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            await registry.pause();
+
+            await expect(registry.supplySubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_ENFORCED_PAUSE);
+        });
+
+        it("Is reverted if the subscriber is not active", async () => {
             const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
 
-            await expect(registry.deleteSubscriber(DEFAULT_SUBSCRIBER_ID))
+            await expect(registry.supplySubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT))
                 .to.be.revertedWithCustomError(registry, REVERT_ERROR_INVALID_SUBSCRIBER_ID);
-
         });
 
-        it("Is reverted if the caller is not the owner of the subscriber", async () => {
+        it("Is reverted if caller is not the subscriber owner", async () => {
             const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID);
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
             const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
 
-            await expect(registryConnectedToAttacker.deleteSubscriber(DEFAULT_SUBSCRIBER_ID))
+            await expect(registryConnectedToAttacker.supplySubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT))
                 .to.be.revertedWithCustomError(registry, REVERT_ERROR_UNAUTHORIZED);
+        });
+    });
 
+    describe("Function 'claimEarnings()'", async () => {
+        it("Executes as expected if subscriber balance is sufficient", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
+            await registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID);
+            const registryConnectedToProvider = await registry.connect(provider) as Contract;
+
+            await time.increase(DEFAULT_PERIOD_IN_SECONDS + 1);
+            const tx = await registryConnectedToProvider.claimEarnings(DEFAULT_PROVIDER_ID, [DEFAULT_SUBSCRIBER_ID]);
+            const timestamp = await time.latest();
+
+            await expect(tx)
+                .to.emit(registry, EVENT_NAME_EARNINGS_CLAIMED)
+                .withArgs(DEFAULT_PROVIDER_ID, DEFAULT_SUBSCRIBER_ID, timestamp, timestamp + DEFAULT_PERIOD_IN_SECONDS);
+
+            const subscriptionStatus:SubscriberStatus = await registry.getSubscriberStatus(DEFAULT_SUBSCRIBER_ID);
+            await expect(subscriptionStatus).to.eq(SubscriberStatus.Active);
         });
 
-        describe("Function 'supplySubscriber()'", async () => {
-            it("Executes as expected and emits correct event", async () => {
-                const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-                await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID);
+        it("Executes as expected if subscriber balance is insufficient", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
+            await registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID);
+            const registryConnectedToProvider = await registry.connect(provider) as Contract;
 
-                const oldFreeBalance: number = Number(await registry.calculateFreeBalance(DEFAULT_SUBSCRIBER_ID));
+            await time.increase(DEFAULT_PERIOD_IN_SECONDS + 1);
 
-                const tx = await registry.supplySubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_FEE);
+            await registryConnectedToProvider.claimEarnings(DEFAULT_PROVIDER_ID, [DEFAULT_SUBSCRIBER_ID]);
+            await time.increase(DEFAULT_PERIOD_IN_SECONDS + 1);
 
-                await expect(tx)
-                    .to.emit(registry, EVENT_NAME_FUNDS_DEPOSITED)
-                    .withArgs(deployer.address, DEFAULT_SUBSCRIBER_ID, DEFAULT_FEE);
+            await expect(registryConnectedToProvider.claimEarnings(DEFAULT_PROVIDER_ID, [DEFAULT_SUBSCRIBER_ID]))
+                .to.emit(registry, EVENT_NAME_SUBSCRIPTION_PAUSED)
+                .withArgs(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID)
+                .and.not.to.emit(registry, EVENT_NAME_EARNINGS_CLAIMED)
 
-                await expect(tx)
-                    .to.changeTokenBalances(
-                        token,
-                        [registry, deployer],
-                        [+DEFAULT_FEE, -DEFAULT_FEE]
-                    );
-
-                expect(Number(await registry.calculateFreeBalance(DEFAULT_SUBSCRIBER_ID))).to.eq(oldFreeBalance + DEFAULT_FEE);
-            });
-
-            it("Is reverted if the contract is paused", async () => {
-                const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-                await registry.pause();
-
-                await expect(registry.supplySubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT))
-                    .to.be.revertedWithCustomError(registry, REVERT_ERROR_ENFORCED_PAUSE);
-            });
-
-            it("Is reverted if the subscriber is not active", async () => {
-                const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-
-                await expect(registry.supplySubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT))
-                    .to.be.revertedWithCustomError(registry, REVERT_ERROR_INVALID_SUBSCRIBER_ID);
-            });
-
-            it("Is reverted if caller is not the subscriber owner", async () => {
-                const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-                await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID);
-                const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
-
-                await expect(registryConnectedToAttacker.supplySubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT))
-                    .to.be.revertedWithCustomError(registry, REVERT_ERROR_UNAUTHORIZED);
-            });
+            const subscriptionStatus:SubscriberStatus = await registry.getSubscriberStatus(DEFAULT_SUBSCRIBER_ID);
+            await expect(subscriptionStatus).to.eq(SubscriberStatus.Paused);
         });
 
-        describe("Function 'claimEarnings()'", async () => {
-            it("Executes as expected if subscriber balance is sufficient", async () => {
-                const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-                await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID);
-                const registryConnectedToProvider = await registry.connect(provider) as Contract;
+        it("Is reverted if the contract is paused", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            await registry.pause();
 
-                await time.increase(DEFAULT_PERIOD_IN_SECONDS + 1);
-
-                const tx = await registryConnectedToProvider.claimEarnings(DEFAULT_PROVIDER_ID, DEFAULT_SUBSCRIBER_ID);
-                const timestamp = await time.latest();
-
-                await expect(tx)
-                    .to.emit(registry, EVENT_NAME_EARNINGS_CLAIMED)
-                    .withArgs(DEFAULT_PROVIDER_ID, timestamp, timestamp + DEFAULT_PERIOD_IN_SECONDS);
-
-                const subscriptionStatus:SubscriberStatus = await registry.getSubscriberStatus(DEFAULT_SUBSCRIBER_ID);
-                await expect(subscriptionStatus).to.eq(SubscriberStatus.Active);
-            });
-
-            it("Executes as expected if subscriber balance is insufficient", async () => {
-                const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-                await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID);
-                const registryConnectedToProvider = await registry.connect(provider) as Contract;
-
-                await time.increase(DEFAULT_PERIOD_IN_SECONDS + 1);
-
-                await registryConnectedToProvider.claimEarnings(DEFAULT_PROVIDER_ID, DEFAULT_SUBSCRIBER_ID);
-                await time.increase(DEFAULT_PERIOD_IN_SECONDS + 1);
-
-                await expect(registryConnectedToProvider.claimEarnings(DEFAULT_PROVIDER_ID, DEFAULT_SUBSCRIBER_ID))
-                    .to.emit(registry, EVENT_NAME_SUBSCRIPTION_PAUSED)
-                    .withArgs(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID)
-                    .and.not.to.emit(registry, EVENT_NAME_EARNINGS_CLAIMED)
-
-                const subscriptionStatus:SubscriberStatus = await registry.getSubscriberStatus(DEFAULT_SUBSCRIBER_ID);
-                await expect(subscriptionStatus).to.eq(SubscriberStatus.Paused);
-            });
-
-            it("Is reverted if the contract is paused", async () => {
-                const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-                await registry.pause();
-
-                await expect(registry.claimEarnings(DEFAULT_PROVIDER_ID, DEFAULT_SUBSCRIBER_ID))
-                    .to.be.revertedWithCustomError(registry, REVERT_ERROR_ENFORCED_PAUSE);
-            });
-
-            it("Is reverted if the provider is not active", async () => {
-                const { registry } = await loadFixture(deployRegistry);
-
-                await expect(registry.claimEarnings(DEFAULT_PROVIDER_ID, DEFAULT_SUBSCRIBER_ID))
-                    .to.be.revertedWithCustomError(registry, REVERT_ERROR_INVALID_PROVIDER_ID);
-            });
-
-            it("Is reverted if the caller is not provider owner", async () => {
-                const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-                const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
-
-                await expect(registryConnectedToAttacker.claimEarnings(DEFAULT_PROVIDER_ID, DEFAULT_SUBSCRIBER_ID))
-                    .to.be.revertedWithCustomError(registry, REVERT_ERROR_UNAUTHORIZED);
-            });
-
-            it("Is reverted if the claim period did not pass", async () => {
-                const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-                const registryConnectedToProvider = await registry.connect(provider) as Contract;
-                await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID);
-
-                await time.increase(DEFAULT_PERIOD_IN_SECONDS);
-                await registryConnectedToProvider.claimEarnings(DEFAULT_PROVIDER_ID, DEFAULT_SUBSCRIBER_ID);
-
-                await expect(registryConnectedToProvider.claimEarnings(DEFAULT_PROVIDER_ID, DEFAULT_SUBSCRIBER_ID))
-                    .to.be.revertedWithCustomError(registry, REVERT_ERROR_EARLY_CLAIM);
-            });
+            await expect(registry.claimEarnings(DEFAULT_PROVIDER_ID, [DEFAULT_SUBSCRIBER_ID]))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_ENFORCED_PAUSE);
         });
 
-        describe("Function 'withdrawEarnings()'", async () => {
-           it("Executes as expected and emits correct event", async () => {
-               const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-               const registryConnectedToProvider = await registry.connect(provider) as Contract;
-               await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT, DEFAULT_PROVIDER_ID);
+        it("Is reverted if the provider is not active", async () => {
+            const { registry } = await loadFixture(deployRegistry);
 
-               const earningsUSD = await registry.previewProviderEarningsUSD(DEFAULT_PROVIDER_ID);
-
-               const tx = registryConnectedToProvider.withdrawEarnings(DEFAULT_PROVIDER_ID);
-
-               await expect(tx)
-                   .to.emit(registry, EVENT_NAME_FUNDS_WITHDRAWN)
-                   .withArgs(DEFAULT_PROVIDER_ID, DEFAULT_FEE, earningsUSD);
-
-               await expect(tx)
-                   .to.changeTokenBalances(
-                       token,
-                       [registry, provider],
-                       [-DEFAULT_FEE, +DEFAULT_FEE]
-                   );
-
-               expect(await registry.previewProviderEarningsUSD(DEFAULT_PROVIDER_ID)).to.eq(0);
-               expect(await registry.previewProviderEarnings(DEFAULT_PROVIDER_ID)).to.eq(0);
-           });
-
-           it("Is reverted if the caller is not the owner of the provider", async() => {
-               const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-               const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
-
-               await expect(registryConnectedToAttacker.withdrawEarnings(DEFAULT_PROVIDER_ID))
-                   .to.be.revertedWithCustomError(registry, REVERT_ERROR_UNAUTHORIZED);
-           });
-
-            it("Is reverted if the contract is paused", async() => {
-                const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
-                await registry.pause();
-
-                await expect(registry.withdrawEarnings(DEFAULT_PROVIDER_ID))
-                    .to.be.revertedWithCustomError(registry, REVERT_ERROR_ENFORCED_PAUSE);
-            });
+            await expect(registry.claimEarnings(DEFAULT_PROVIDER_ID, [DEFAULT_SUBSCRIBER_ID]))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_INVALID_PROVIDER_ID);
         });
 
-        describe("Function 'updateProviderStatus()'", async () => {
-            it("Executes as expected and emits correct event", async () => {
-                const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+        it("Is reverted if one of subscriptions is inactive", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            const registryConnectedToProvider = await registry.connect(provider) as Contract;
 
-                await expect(registry.updateProviderStatus(DEFAULT_PROVIDER_ID, ProviderStatus.Inactive))
-                    .to.emit(registry, EVENT_NAME_PROVIDER_STATUS_UPDATED)
-                    .withArgs(DEFAULT_PROVIDER_ID, ProviderStatus.Inactive);
-            });
-
-            it("Is reverted if the caller is not the owner", async () => {
-                const { registry } = await loadFixture(deployRegistry);
-                const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
-
-                await expect(registryConnectedToAttacker.updateProviderStatus(DEFAULT_PROVIDER_ID, ProviderStatus.Inactive))
-                    .to.be.revertedWithCustomError(registry, REVERT_ERROR_OWNABLE_UNAUTHORIZED_ACCOUNT);
-            });
-
-            it("Is reverted if the provider with the provided id is not active", async () => {
-                const { registry } = await loadFixture(deployRegistry);
-
-                await expect(registry.updateProviderStatus(DEFAULT_PROVIDER_ID, ProviderStatus.Inactive))
-                    .to.be.revertedWithCustomError(registry, REVERT_ERROR_INVALID_PROVIDER_ID);
-            });
+            await expect(registryConnectedToProvider.claimEarnings(DEFAULT_PROVIDER_ID, [DEFAULT_SUBSCRIBER_ID]))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_INACTIVE_SUBSCRIPTION);
         });
 
-        describe("Function 'configureMaxProviderCount()'", async () => {
-           it("Executes as expected and emits correct event", async () => {
-               const { registry } = await loadFixture(deployRegistry);
+        it("Is reverted if the caller is not provider owner", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
 
-               await expect(registry.configureMaxProviderCount(STARTING_MAX_PROVIDER_COUNT + 1))
-                   .to.emit(registry, EVENT_NAME_MAX_PROVIDER_COUNT_CONFIGURED)
-                   .withArgs(STARTING_MAX_PROVIDER_COUNT + 1);
-           });
+            await expect(registryConnectedToAttacker.claimEarnings(DEFAULT_PROVIDER_ID, [DEFAULT_SUBSCRIBER_ID]))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_UNAUTHORIZED);
+        });
 
-           it("Is reverted if the caller is not the owner", async () => {
-               const { registry } = await loadFixture(deployRegistry);
-               const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
+        it("Is reverted if the claim period did not pass", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            const registryConnectedToProvider = await registry.connect(provider) as Contract;
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
+            await registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID);
 
-               await expect(registryConnectedToAttacker.configureMaxProviderCount(STARTING_MAX_PROVIDER_COUNT + 1))
-                   .to.be.revertedWithCustomError(registry, REVERT_ERROR_OWNABLE_UNAUTHORIZED_ACCOUNT);
-           });
+            await time.increase(DEFAULT_PERIOD_IN_SECONDS);
+            await registryConnectedToProvider.claimEarnings(DEFAULT_PROVIDER_ID, [DEFAULT_SUBSCRIBER_ID]);
 
-           it("Is reverted if the new amount is invalid", async () => {
-               const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            await expect(registryConnectedToProvider.claimEarnings(DEFAULT_PROVIDER_ID, [DEFAULT_SUBSCRIBER_ID]))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_EARLY_CLAIM);
+        });
+    });
 
-               await expect(registry.configureMaxProviderCount(0))
-                   .to.be.revertedWithCustomError(registry, REVERT_ERROR_INVALID_MAX_PROVIDER_COUNT);
-           });
+    describe("Function 'withdrawEarnings()'", async () => {
+        it("Executes as expected and emits correct event", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            const registryConnectedToProvider = await registry.connect(provider) as Contract;
+            await registry.registerSubscriber(DEFAULT_SUBSCRIBER_ID, DEFAULT_STARTING_DEPOSIT);
+            await registry.addSubscription(DEFAULT_SUBSCRIBER_ID, DEFAULT_PROVIDER_ID);
+
+            const earningsUSD = await registry.previewProviderEarningsUSD(DEFAULT_PROVIDER_ID);
+
+            const tx = registryConnectedToProvider.withdrawEarnings(DEFAULT_PROVIDER_ID);
+
+            await expect(tx)
+                .to.emit(registry, EVENT_NAME_FUNDS_WITHDRAWN)
+                .withArgs(DEFAULT_PROVIDER_ID, DEFAULT_FEE, earningsUSD);
+
+            await expect(tx)
+                .to.changeTokenBalances(
+                    token,
+                    [registry, provider],
+                    [-DEFAULT_FEE, +DEFAULT_FEE]
+                );
+
+            expect(await registry.previewProviderEarningsUSD(DEFAULT_PROVIDER_ID)).to.eq(0);
+            expect(await registry.previewProviderEarnings(DEFAULT_PROVIDER_ID)).to.eq(0);
+        });
+
+        it("Is reverted if the caller is not the owner of the provider", async() => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
+
+            await expect(registryConnectedToAttacker.withdrawEarnings(DEFAULT_PROVIDER_ID))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_UNAUTHORIZED);
+        });
+
+        it("Is reverted if the contract is paused", async() => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+            await registry.pause();
+
+            await expect(registry.withdrawEarnings(DEFAULT_PROVIDER_ID))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_ENFORCED_PAUSE);
+        });
+    });
+
+    describe("Function 'updateProviderStatus()'", async () => {
+        it("Executes as expected and emits correct event", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+
+            await expect(registry.updateProviderStatus(DEFAULT_PROVIDER_ID, ProviderStatus.Inactive))
+                .to.emit(registry, EVENT_NAME_PROVIDER_STATUS_UPDATED)
+                .withArgs(DEFAULT_PROVIDER_ID, ProviderStatus.Inactive);
+        });
+
+        it("Is reverted if the caller is not the owner", async () => {
+            const { registry } = await loadFixture(deployRegistry);
+            const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
+
+            await expect(registryConnectedToAttacker.updateProviderStatus(DEFAULT_PROVIDER_ID, ProviderStatus.Inactive))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_OWNABLE_UNAUTHORIZED_ACCOUNT);
+        });
+
+        it("Is reverted if the provider with the provided id is not active", async () => {
+            const { registry } = await loadFixture(deployRegistry);
+
+            await expect(registry.updateProviderStatus(DEFAULT_PROVIDER_ID, ProviderStatus.Inactive))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_INVALID_PROVIDER_ID);
+        });
+    });
+
+    describe("Function 'configureMaxProviderCount()'", async () => {
+        it("Executes as expected and emits correct event", async () => {
+            const { registry } = await loadFixture(deployRegistry);
+
+            await expect(registry.configureMaxProviderCount(STARTING_MAX_PROVIDER_COUNT + 1))
+                .to.emit(registry, EVENT_NAME_MAX_PROVIDER_COUNT_CONFIGURED)
+                .withArgs(STARTING_MAX_PROVIDER_COUNT + 1);
+        });
+
+        it("Is reverted if the caller is not the owner", async () => {
+            const { registry } = await loadFixture(deployRegistry);
+            const registryConnectedToAttacker = await registry.connect(attacker) as Contract;
+
+            await expect(registryConnectedToAttacker.configureMaxProviderCount(STARTING_MAX_PROVIDER_COUNT + 1))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_OWNABLE_UNAUTHORIZED_ACCOUNT);
+        });
+
+        it("Is reverted if the new amount is invalid", async () => {
+            const { registry } = await loadFixture(deployRegistryAndRegisterProvider);
+
+            await expect(registry.configureMaxProviderCount(0))
+                .to.be.revertedWithCustomError(registry, REVERT_ERROR_INVALID_MAX_PROVIDER_COUNT);
         });
     });
 });
